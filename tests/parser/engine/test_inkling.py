@@ -504,3 +504,72 @@ class TestRegisteredAdapters:
         assert result.tools_called
         assert result.tool_calls[0].function.name == "f"
         assert json.loads(result.tool_calls[0].function.arguments) == {"a": 1}
+
+
+class TestDelegatingTurnInitialToolCall:
+    """Served reasoning+tool ``DelegatingParser`` path (issue #50512).
+
+    A streaming turn that opens directly with a tool block, with no thinking
+    block ahead of it, must reach the tool pass instead of leaking the raw
+    ``<|content_invoke_tool_json|>...<|end_message|>`` block into content.
+    """
+
+    PROMPT = [_TML_VOCAB[MSG_MODEL]]
+
+    @staticmethod
+    def _stream(mock_tokenizer, mock_request, text, chunk_size):
+        mock_request.tools = []
+        parser = ParserManager.get_parser(
+            tool_parser_name="inkling",
+            reasoning_parser_name="inkling",
+            enable_auto_tools=True,
+        )(mock_tokenizer, [])
+        tokens = _tokenize(text)
+        content, names, args = "", {}, {}
+        for start in range(0, len(tokens), chunk_size):
+            batch = tokens[start : start + chunk_size]
+            delta = parser.parse_delta(
+                "".join(t for _, t in batch),
+                [tid for tid, _ in batch],
+                mock_request,
+                prompt_token_ids=TestDelegatingTurnInitialToolCall.PROMPT
+                if start == 0
+                else None,
+                finished=start + chunk_size >= len(tokens),
+            )
+            if delta and delta.content:
+                content += delta.content
+            for tc in (delta.tool_calls or []) if delta else []:
+                if tc.function and tc.function.name:
+                    names[tc.index] = tc.function.name
+                if tc.function and tc.function.arguments:
+                    args[tc.index] = args.get(tc.index, "") + tc.function.arguments
+        return content, names, args
+
+    @pytest.mark.parametrize("chunk_size", [1, 3, 64])
+    def test_tool_call_without_thinking(
+        self, mock_tokenizer, mock_request, chunk_size
+    ):
+        content, names, args = self._stream(
+            mock_tokenizer,
+            mock_request,
+            _tool_block("ask_followup_question", '{"question":"Which?"}'),
+            chunk_size,
+        )
+        assert TOOL_JSON not in content
+        assert END_MESSAGE not in content
+        assert list(names.values()) == ["ask_followup_question"]
+        assert json.loads(args[0]) == {"question": "Which?"}
+
+    @pytest.mark.parametrize("chunk_size", [1, 64])
+    def test_tool_call_after_thinking(self, mock_tokenizer, mock_request, chunk_size):
+        content, names, args = self._stream(
+            mock_tokenizer,
+            mock_request,
+            f"{THINK_START}hmm{END_MESSAGE}{MSG_MODEL}"
+            + _tool_block("f", '{"a":1}'),
+            chunk_size,
+        )
+        assert TOOL_JSON not in content
+        assert list(names.values()) == ["f"]
+        assert json.loads(args[0]) == {"a": 1}
