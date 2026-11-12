@@ -67,13 +67,13 @@ Note the gn13/gn14 IB measurement: NCCL ran NET/IB with GDR 0 across nodes (see 
 
 | Where | Blackwell dependency | Ampere plan |
 |---|---|---|
-| `ops/attention.py` (1.3k lines), `attention.py` | Prefill: vendored `tml_fa4` (`flash_fwd_sm100`). Decode/verify: Gluon kernels using `gl.nvidia.blackwell` (TMEM, tcgen05 MMA, TMA) | Port avtc's `vllm/models/inkling/nvidia/ops/triton_rel_attention.py` (757 lines, already works on SM80). Inkling 2 adds the sink gate, log-scaling tau, FP32 output, and pre-sheared rel bias: diff against the PR's torch reference in `tests/models/inkling2/test_attention.py`. **Biggest risk.** |
+| `ops/attention.py` (1.3k lines), `attention.py` | Prefill: vendored `tml_fa4` (`flash_fwd_sm100`). Decode/verify: Gluon kernels using `gl.nvidia.blackwell` (TMEM, tcgen05 MMA, TMA) | **Written, untested**: `ops/attention_triton.py` (`rel_attention`), one Triton kernel for prefill, decode and verify, split-KV with a torch LSE merge. It reads the prologue's sheared rel logits directly (so `attention_prologue` stays shared), returns fp32 out + natural-log LSE, and the existing `gate_sink` applies the gate and sink. `attention.py` picks it off SM100 (`self.use_triton`) and skips the Gluon decode planning. Test: `tests/models/inkling2/test_attention_triton.py` against the PR's fp32 reference, including TP8 head shards (6 Q / 1 KV head), mixed batches, and CUDA-graph padding rows. Written fresh rather than ported from avtc: the sheared layout and LSE output differ enough. **Biggest risk**; performance is untuned |
 | `moe.py`, `ops/trtllm_bmm.py`, `ops/moe.py` | Expert GEMMs are FlashInfer `trtllm_gen` SM100 BMMs, with NVFP4/MXFP8 activation quantization fused into `route` and `swiglu_quantize`. The loader shuffles rows and swizzles scales into the SM100 layout | **Written, untested**: `moe_marlin.py` (`Inkling2MarlinExperts`, picked in `Inkling2MoE` off SM100). Raw row-major load, Marlin repack in `process_weights_after_loading`, torch routing, `fused_marlin_moe` with a custom softcapped-SwiGLU activation (routing weight applied there, `mul_topk_weights_in_gemm2=False`). NVFP4 global scale per expert = `amax / outer_scale_denominator`. Test: `tests/models/inkling2/test_moe_marlin.py` (`INKLING2_CKPT=<snapshot>` adds real layers 0 and 40) |
 | `ops/dspark.py` | `torch.ops._C.inkling2_dspark_argmax` and multicast, built only for `10.0a/10.3a` | Torch argmax fallback. (`conv_mix`/`seq_parallel` ops are unreachable off SM100, see the next row) |
 | `ops/allreduce.py`, `model.py` forward | NVLink multicast Lamport all-reduce; seq-parallel and fused conv-mix are gated on the workspace | `Inkling2AllReduceWorkspace.create` returns `None` off SM100, which also turns off `seq_parallel` and `conv_mix` (`model.py:226-276`), so the forward takes the unfused NCCL path and never calls the `_C.inkling2_*` conv-mix ops. Verify only |
-| `ops/linear.py` | FlashInfer `mm_bf16` and a Triton TMA (`TensorDescriptor`) kernel | `F.linear` / `torch.mm` on SM80 |
+| `ops/linear.py` | FlashInfer `mm_bf16` and a Triton TMA (`TensorDescriptor`) kernel | **Done (untested)**: off SM100, `linear` uses cuBLAS for every batch and `k_group_partials` (router logits) skips the TMA kernel for the plain Triton one |
 | `dspark.py` | FlashInfer TRT-LLM fused all-reduce + norm | Unfused all-reduce + `rms_norm` |
-| `ops/{norm,attn_res,sconv,activation,mxfp8,nvfp4,vision}.py` | Plain Triton (`tldevice` intrinsics) | Expected to work on SM80; confirm with tests. `nvfp4`/`mxfp8` activation quantization is dropped on the Ampere path anyway |
+| `ops/{norm,attn_res,sconv,activation,mxfp8,nvfp4,vision}.py` | Plain Triton (`tldevice` intrinsics), but most kernels call `gdc_wait`/`gdc_launch_dependents` and launch with `launch_pdl=True` (programmatic dependent launch, SM90+) | Expected to work on SM80; `check_ampere.py` probes whether Triton accepts PDL on sm80. If it doesn't, add one switch that strips `launch_pdl` off SM90. `nvfp4`/`mxfp8` activation quantization is dropped on the Ampere path anyway |
 
 Numerics: the model was trained with NVFP4 *activations*. BF16 activations on Ampere are more precise but a
 different path, so quality needs a check (ChatHPC `bench/effort-sweep.py`, a few MMMU/HLE samples via
@@ -98,11 +98,12 @@ publishes an Ampere port.
 - [x] Branch from PR #67325, `avtc` remote added
 - [x] Blackwell dependency inventory (table above)
 - [ ] Checkpoint downloaded to `/scratch/chathpc-dev/vllm/huggingface/hub`
-- [ ] `vllm-openai_inkling-2-small.sif` pulled; `check-ampere.sh` results recorded here
+- [ ] `vllm-openai_inkling-2-small.sif` pulled; `check-ampere.sh` results recorded here. Then `ChatHPC/inkling2/test-ampere.sh` runs the MoE and attention tests in the image
   - The image Dockerfile builds `TORCH_CUDA_ARCH_LIST='7.5 8.0 ... 12.0'` (CUDA 13.2), so sm80 kernels are
     expected; the check confirms it.
 - [ ] Ampere MoE: written (`moe_marlin.py`), needs `pytest tests/models/inkling2/test_moe_marlin.py` on an A100
-- [ ] Ampere attention
+- [ ] Ampere attention: written (`ops/attention_triton.py`), needs `test_attention_triton.py` on an A100
+- [ ] `ops/linear.py` fallback: written
 - [ ] Remaining fallbacks
 - [ ] Truncated-model logits match
 - [ ] Full model serving on 8 GPUs

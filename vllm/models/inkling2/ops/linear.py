@@ -3,14 +3,24 @@
 """bf16 linears: small batches on FlashInfer's CuTe DSL low-M kernels, and the
 reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
 
+import functools
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import is_flashinfer_autotuning
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
 LOW_M_MAX_TOKENS = 32
+
+
+@functools.cache
+def _has_sm100_kernels() -> bool:
+    """FlashInfer's CuTe DSL GEMMs and the TMA kernel need Blackwell; other
+    GPUs (Ampere) use cuBLAS and the plain Triton K-group kernel."""
+    return current_platform.is_device_capability_family(100)
 
 
 def linear(
@@ -22,7 +32,11 @@ def linear(
         assert x.shape[0] > LOW_M_MAX_TOKENS
         return torch.mm(x, weight.t(), out=out)
     # Autotuning would profile the CuTe DSL kernels past their 32-row limit.
-    if x.shape[0] > LOW_M_MAX_TOKENS or is_flashinfer_autotuning():
+    if (
+        x.shape[0] > LOW_M_MAX_TOKENS
+        or not _has_sm100_kernels()
+        or is_flashinfer_autotuning()
+    ):
         return torch.nn.functional.linear(x, weight)
     from flashinfer import mm_bf16
 
@@ -192,7 +206,7 @@ def k_group_partials(
     assert x.is_contiguous() and weight.is_contiguous()
     tokens, hidden = x.shape
     n = weight.shape[0]
-    if tokens >= TMA_MIN_TOKENS:
+    if tokens >= TMA_MIN_TOKENS and _has_sm100_kernels():
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)

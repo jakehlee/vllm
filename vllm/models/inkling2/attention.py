@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -53,6 +54,7 @@ from .ops.attention import (
     plan_decode_attention,
     rel_decode_attention,
 )
+from .ops.attention_triton import rel_attention
 from .ops.linear import linear
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
@@ -216,7 +218,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if prefix in forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         forward_context[prefix] = self
-        if vllm_config.kernel_config.enable_jit_warmup:
+        # tml_fa4 and the Gluon decode kernels need SM100; elsewhere every token
+        # runs on the portable Triton kernel (`ops.attention_triton`).
+        self.use_triton = not current_platform.is_device_capability_family(100)
+        if vllm_config.kernel_config.enable_jit_warmup and not self.use_triton:
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
     def process_weights_after_loading(self) -> None:
@@ -337,7 +342,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if isinstance(attn_metadata, dict) and self.kv_cache.numel() > 0:
             md = cast(Inkling2AttentionMetadata, attn_metadata[self.prefix])
         num_decodes, num_decode_tokens, decode_splits = 0, 0, 0
-        if md is not None:
+        if md is not None and not self.use_triton:
             num_decodes, num_decode_tokens, decode_splits = self._plan_decode(
                 md, num_tokens
             )
@@ -399,7 +404,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 dtype=torch.float32,
             )
             lse = q.new_empty((self.num_heads, out.shape[0]), dtype=torch.float32)
-            if md is not None:
+            if md is not None and self.use_triton:
+                self._triton_attention(md, clipped_q, rel_logits, out, lse.t())
+            elif md is not None:
                 num_splits, use_scheduler = plan_attention(
                     self.is_local,
                     md.query_lens_cpu[num_decodes:],
@@ -489,6 +496,32 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             softmax_scale=self.scaling,
             is_local=self.is_local,
             num_splits=num_splits,
+        )
+
+    def _triton_attention(
+        self,
+        md: FlashAttentionMetadata,
+        q: torch.Tensor,
+        rel_logits: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+    ) -> None:
+        """The whole batch on the Triton kernel (non-SM100)."""
+        key_cache, value_cache = self._split_kv_cache()
+        rel_attention(
+            q,
+            key_cache,
+            value_cache,
+            rel_logits,
+            block_table=md.block_table,
+            seq_lens=md.seq_lens,
+            cu_seqlens_q=md.query_start_loc,
+            max_query_len=md.max_query_len,
+            max_seq_len=md.max_seq_len,
+            softmax_scale=self.scaling,
+            window_left=self.window_size[0] if self.is_local else 0,
+            out=out,
+            lse=lse,
         )
 
     def _fa4_attention(
