@@ -1,4 +1,12 @@
 <!-- markdownlint-disable MD001 MD041 -->
+> [!IMPORTANT]
+> **This is the `inkling2-ampere` branch of a personal fork, not upstream vLLM.** It is a work-in-progress port of
+> [Inkling 2 Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) to Ampere (A100) GPUs, built on
+> [vllm-project/vllm#67325](https://github.com/vllm-project/vllm/pull/67325), whose kernels are Blackwell (SM100)
+> only. The released NVFP4/MXFP8 checkpoint is served unmodified, with weight-only Marlin GEMMs for the experts.
+> Blackwell code paths are left untouched; Ampere fallbacks are selected by GPU capability.
+> Status, plan, and design notes: [`CLAUDE.md`](CLAUDE.md). Not intended for upstream merge as-is.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

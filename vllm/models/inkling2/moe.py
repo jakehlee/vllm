@@ -22,6 +22,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
+from .moe_marlin import Inkling2MarlinExperts, select_experts, use_marlin_experts
 from .ops.activation import swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
@@ -246,7 +247,12 @@ class Inkling2MoE(nn.Module):
         super().__init__()
         assert config.n_shared_experts == 0
         self.gate = Inkling2Gate(config)
-        self.experts = Inkling2Experts(config, quant_format)
+        self.marlin = use_marlin_experts()
+        self.experts = (
+            Inkling2MarlinExperts(config, quant_format)
+            if self.marlin
+            else Inkling2Experts(config, quant_format)
+        )
 
     def forward(
         self,
@@ -270,6 +276,14 @@ class Inkling2MoE(nn.Module):
             )
         x = x.contiguous()
         gate, experts = self.gate, self.experts
+        if self.marlin:
+            # No fused all-reduce or sequence parallelism off SM100: the model
+            # only takes the `reduce=True` path.
+            assert reduce and push is None
+            weights, ids = select_experts(
+                x, gate.weight, gate.bias, gate.topk, gate.route_scale
+            )
+            return experts(x, weights, ids)
         plan = experts.plan(x.shape[0])
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
