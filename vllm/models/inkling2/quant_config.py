@@ -42,7 +42,9 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        # SM100 runs the experts natively; older GPUs (Ampere+) run them as
+        # weight-only Marlin GEMMs (`moe_marlin`).
+        return 80
 
     @staticmethod
     def get_config_filenames() -> list[str]:
