@@ -89,7 +89,7 @@ different path, so quality needs a check (ChatHPC `bench/effort-sweep.py`, a few
 | Day | Work | Done when |
 |---|---|---|
 | **Thu 11-12** | Checkpoint, images, MoE + attention fallbacks, PDL gate, A100 unit tests; DSpark + ViT fallbacks; truncated run | **Done**: 73/73 tests, truncated run answers all 5 request types |
-| **Fri 11-13** (one node) | Truncated runs of each later toggle: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=1`; production job scripts | CUDA graphs and DSpark (both samplers) **pass**; images pending |
+| **Fri 11-13** (one node) | Truncated runs of each later toggle: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=1`; production job scripts | **All pass**: CUDA graphs, DSpark (both samplers), images |
 | **Sat-Sun** (when gn11-14 are free) | Full model TP8 (`submit-tp8.sh`), eager, text only -> effort sweep -> CUDA graphs -> DSpark -> vision, one change per restart | Correct answers through the API |
 | **Mon 11-16** | Front-end integration (gn14 job with nginx/OWUI/LiteLLM), LiteLLM entry, `bench/bench-concurrency.py`, go live | Public endpoint serves it |
 
@@ -150,11 +150,11 @@ Next. Steps 1-4 need one node; the TP8 steps need all four.
    Acceptance 0.1% (1 of ~1500 drafted), **expected**: the draft reads features of a 12-layer target it was
    never trained on. With nothing accepted, decode was 18-20 tok/s vs 25 without DSpark (7 drafted tokens
    per step cost ~25% here). Real acceptance needs the full model
-4. [ ] `IMAGES=1` truncated (651045): the server started with the ViT (encoder cache profiled with one image,
-   no errors) and the 5 text requests passed, but **the image request never reached vLLM**: the script passed
-   the 139 KB base64 body as one `curl -d` argument, over Linux's 128 KB per-argument limit (`Argument list
-   too long`). Fixed (body written to a file, `-d @file`); rerun `IMAGES=1 sbatch inkling2/truncated-gn13.sh`
-5. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only: check worker logs first
+4. [x] `IMAGES=1` truncated (651046; 651045's image request never left the script, `curl` argument too long,
+   now fixed with `-d @file`): the ViT loads (encoder cache profiled with one image) and **the image request
+   returns 200** with 119 prompt tokens = 96 image tokens (480x320 at 40 px per merged patch: 12 x 8) + 23
+   text, so the processor, the ViT on FA2 and the embedding merge all run. No errors. The text requests pass too
+   5. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only: check worker logs first
 6. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) through port 3012
 7. [ ] TP8 `ENFORCE_EAGER=0`, then `DSPARK=1` (check acceptance in `SpecDecoding metrics`), then `IMAGES=4`,
    one change per restart
