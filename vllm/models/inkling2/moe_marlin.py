@@ -48,7 +48,10 @@ def select_experts(
     bias, weighted by the renormalized sigmoid of the selected logits. The
     logits are fp32, as in the SM100 router (`ops.linear.linear_k_groups`)."""
     logits = x.float() @ weight.float().T
-    _, ids = torch.topk(logits.sigmoid() + bias, topk, dim=-1, sorted=True)
+    # A stable descending sort breaks ties toward the lower expert index, like
+    # the SM100 router; torch.topk does not.
+    scores = logits.sigmoid() + bias
+    ids = torch.sort(scores, dim=-1, descending=True, stable=True).indices[:, :topk]
     selected = torch.nn.functional.logsigmoid(logits.gather(1, ids))
     return selected.softmax(-1) * route_scale, ids.to(torch.int32)
 

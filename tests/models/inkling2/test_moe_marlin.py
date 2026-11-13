@@ -41,7 +41,9 @@ def dist_init():
         initialize_model_parallel(1, 1)
         yield
     cleanup_dist_env_and_memory()
-    os.remove(path)
+    # The FileStore may already have deleted it.
+    if os.path.exists(path):
+        os.remove(path)
 
 
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]

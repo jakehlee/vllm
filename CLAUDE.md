@@ -18,9 +18,9 @@ Small", WoosukKwon), which states **"Blackwell (SM100) only"**. Remote `avtc` ha
 - **No requantization by default.** The routed experts are the only quantized weights; vLLM's Marlin MoE kernels
   run NVFP4 (`prepare_nvfp4_moe_layer_for_marlin`) and MXFP8 (`prepare_mxfp8_moe_layer_for_marlin`) weights as
   weight-only on SM80 with BF16 activations. Everything else in the checkpoint is BF16.
-- **The image is the base.** Like Inkling 1, build `vllm-inkling2-ampere.sif` = `vllm/vllm-openai:inkling-2-small`
-  plus the changed `.py` files from this branch, **if** that image ships SM80 kernels (checked in step 1). A
-  source build is the fallback and costs most of a day.
+- **The image is the base.** Like Inkling 1, `vllm-inkling2-ampere.sif` = an official vLLM CI nightly plus this
+  branch's `.py` files (`ChatHPC/inkling2/vllm-inkling2-ampere.def`). **Not** `vllm/vllm-openai:inkling-2-small`:
+  it is built for `10.0+PTX` only, and its sm_80 Marlin coverage is partial (fp16 yes, bf16 no).
 - **Every kernel replacement gets a test against the PR's torch reference** (`tests/models/inkling2/`), runnable
   on a single A100, before it goes into a full-model run. Full-model restarts cost 15+ minutes: change one
   variable per restart.
@@ -104,10 +104,16 @@ publishes an Ampere port.
     Marlin ops are registered; every inkling2 module imports; plain inkling2 Triton (`rms_norm`) runs on sm80.
   - **PDL fails on sm80**: ptxas rejects `griddepcontrol` (needs sm_90). Fixed in `ops/pdl.py`: `gdc_wait` /
     `gdc_launch_dependents` / `launch_pdl` are gated on SM90+ across all inkling2 Triton kernels.
-  - **Marlin GEMM: `no kernel image is available`** on real layer 0 (NVFP4) and 40 (MXFP8) experts, surfacing
-    lazily at the next torch op. Which kernel is missing is open: `ChatHPC/inkling2/diag-marlin.sh` tests
-    GPTQ int4 / NVFP4 / MXFP4 / FP8 Marlin with `CUDA_LAUNCH_BLOCKING=1` and counts Marlin cubins per arch.
-    If the image built no sm80 Marlin kernels, the fallback is building `_C`/`_moe_C` for 8.0 (source build).
+  - **Marlin GEMM: `no kernel image is available`**, root-caused by `diag-marlin.sh`: fp16-activation Marlin
+    (GPTQ int4, NVFP4) works, every **bf16**-activation Marlin kernel is missing. The `inkling-2-small` image is
+    a local build with `TORCH_CUDA_ARCH_LIST=10.0+PTX` (read from its config blob), so sm_80 code exists only
+    through the arch-list fallbacks of some CMake targets. **Fix: base image = official CI nightly
+    `vllm/vllm-openai:nightly-be47189f37f6162991366ff6b91539f6e9d1f432`** (`TORCH_CUDA_ARCH_LIST=7.5 8.0 8.6
+    8.9 9.0 10.0 12.0`), 4 commits before the PR's base, none touching C++. The PR's C++ is SM100-only and
+    unreachable on Ampere, so the branch's Python overlays cleanly: `ChatHPC/inkling2/vllm-inkling2-ampere.def`.
+  - Attention: all 40 `test_attention_triton.py` cases pass on gn13 (A100), including TP8 head shards, mixed
+    batches, and padding rows.
+  - `select_experts` tie-break fixed (stable sort; `torch.topk` broke ties toward the higher index).
 - [ ] `vllm-openai_inkling-2-small.sif` pulled; `check-ampere.sh` results recorded here. Then `ChatHPC/inkling2/test-ampere.sh` runs the MoE and attention tests in the image
   - The image Dockerfile builds `TORCH_CUDA_ARCH_LIST='7.5 8.0 ... 12.0'` (CUDA 13.2), so sm80 kernels are
     expected; the check confirms it.
