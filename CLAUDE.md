@@ -134,7 +134,10 @@ Done:
 
 Next, in order:
 1. [ ] `git pull` in `/scratch/chathpc-dev/vllm-inkling2-ampere`, rebuild the image (see the table)
-2. [ ] `sbatch inkling2/truncated-gn13.sh`. Pass = all 5 requests return. Expect gibberish text (36 of 48
+2. [x] `sbatch inkling2/truncated-gn13.sh` (job 651030, image from `3460a29`, before the DSpark/ViT commit):
+   **all 5 request types returned 200**, no errors in `.err`. Load 18.6 s from local SSD, 41.36 GiB per GPU for
+   12 NVFP4 layers at TP2 (matches the expert estimate: ~47 GiB per GPU at TP8 for all 48), 24 GiB KV, ~25 tok/s
+   single-stream eager. Output is gibberish as expected. Original notes: Pass = all 5 requests return. Expect gibberish text (36 of 48
    layers missing). Likely first failures, cheapest first: an Ampere-incompatible kernel not covered by the
    unit tests (`sconv`, `attn_res`, `norm` prologue paths, `vision` imports); the expert loader under vLLM's
    real loader (`process_weights_after_loading` is called via `weight_utils.py:1547`, which the unit tests
