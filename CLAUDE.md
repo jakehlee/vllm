@@ -76,8 +76,8 @@ Note the gn13/gn14 IB measurement: NCCL ran NET/IB with GDR 0 across nodes (see 
 | `ops/linear.py` | FlashInfer CuTe DSL `mm_bf16` (<=32 rows) and a Triton TMA kernel (router, >=2048 rows) | cuBLAS for every batch; the plain Triton K-group kernel for the router | Written; first exercised by the truncated run |
 | `quant_config.py` | `Inkling2QuantConfig.get_min_capability()` returned 100, so `vllm/config/vllm.py:897` rejects the checkpoint on Ampere before loading | Returns 80 | **Done** (`3460a29`); the unit tests never reached this check |
 | `ops/allreduce.py`, `model.py` forward | NVLink multicast Lamport all-reduce; seq-parallel and fused conv-mix are gated on its workspace | `Inkling2AllReduceWorkspace.create` returns `None` off SM100, which also disables `seq_parallel` and `conv_mix` (`model.py:226-276`): unfused NCCL path, no `_C.inkling2_*` ops | Nothing to write; verify in the truncated-model run |
-| `vision.py` | `tml_fa4.flash_attn_varlen_func` for the ViT attention (the other ViT kernels in `ops/vision.py` are plain Triton) | `_fa2_attention`: vLLM's FA2 varlen (`fa_version=2`, bidirectional, same `cu_seqlens`/`max_seqlen`), off SM100 | Written; `test_vision.py` (vs. a per-image SDPA reference + encoder CUDA-graph replay) now runs off SM100. **Not yet run on A100** |
-| `dspark.py`, `ops/dspark.py` | FlashInfer `rmsnorm` / `fused_add_rmsnorm`, TRT-LLM fused all-reduce + norm, Gluon `block_decode_attention`, `_C.inkling2_dspark_argmax` over NVLink multicast | Off SM100 (`_SM100` in `dspark.py`): `ops.norm.rms_norm` + `_custom_ops.fused_add_rms_norm`; unfused NCCL all-reduce; `attention_triton.block_attention` (the Triton kernel's `DRAFT_BLOCK` mode); `gather_argmax` (per-shard argmax, all-gather of fp32 `(max, index)` pairs, lowest rank wins ties) | Written; `test_dspark_ampere.py` (the SM100 tests' cases ported). **Not yet run on A100** |
+| `vision.py` | `tml_fa4.flash_attn_varlen_func` for the ViT attention (the other ViT kernels in `ops/vision.py` are plain Triton) | `_fa2_attention`: vLLM's FA2 varlen (`fa_version=2`, bidirectional, same `cu_seqlens`/`max_seqlen`), off SM100 | **3/3 `test_vision.py` pass on A100** (per-image SDPA reference, pixel gather, encoder CUDA-graph replay) |
+| `dspark.py`, `ops/dspark.py` | FlashInfer `rmsnorm` / `fused_add_rmsnorm`, TRT-LLM fused all-reduce + norm, Gluon `block_decode_attention`, `_C.inkling2_dspark_argmax` over NVLink multicast | Off SM100 (`_SM100` in `dspark.py`): `ops.norm.rms_norm` + `_custom_ops.fused_add_rms_norm`; unfused NCCL all-reduce; `attention_triton.block_attention` (the Triton kernel's `DRAFT_BLOCK` mode); `gather_argmax` (per-shard argmax, all-gather of fp32 `(max, index)` pairs, lowest rank wins ties) | **17/17 `test_dspark_ampere.py` pass on A100** (the SM100 tests' cases ported, plus CUDA-graph replay) |
 | `ops/{norm,attn_res,sconv,activation,vision}.py` | Plain Triton (`tldevice` intrinsics) | None expected beyond the PDL gate | `rms_norm` verified on A100; the rest gets covered by the truncated-model run |
 
 Numerics: the model was trained with NVFP4 *activations*. BF16 activations on Ampere are more precise but a
@@ -146,8 +146,8 @@ Next, in order:
 4. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) through port 3012
 5. [ ] `ENFORCE_EAGER=0` (CUDA graphs). `attention.py` wraps `_attention` in `eager_break_during_capture`,
    so the Triton attention runs outside graphs; untested on Ampere
-6. [ ] DSpark fallbacks: written (see the table). Run `test-ampere.sh` (now includes `test_dspark_ampere.py`
-   and `test_vision.py`), then `DSPARK=1`. Check `SpecDecoding metrics` acceptance in the log
-7. [ ] ViT fallback: written. Same test run, then `IMAGES=4`
+6. [ ] DSpark fallbacks: **73/73 `test-ampere.sh` on gn13 at `345a36b`** (MoE 13, attention 40, DSpark 17, ViT 3).
+   Rebuild the image from `345a36b`+, then `DSPARK=1`. Check `SpecDecoding metrics` acceptance in the log
+7. [ ] ViT fallback: tested (same run). Then `IMAGES=4`
 8. [ ] Front end: fold the vLLM block of `tp8-node.sh` into a gn14 job with nginx/OWUI/LiteLLM (template:
    `../ChatHPC/llm-prod-inkling-dep-gn14.sh`), add a LiteLLM entry, benchmark
