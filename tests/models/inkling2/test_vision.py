@@ -17,9 +17,10 @@ from vllm.models.inkling2.vision import (
     Inkling2VisionEncoder,
 )
 
+# SM100 runs the ViT attention on tml_fa4, Ampere and Hopper on FA2.
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="needs a Blackwell GPU",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="needs an Ampere or newer GPU",
 )
 
 CONFIG = {

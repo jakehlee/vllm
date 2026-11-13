@@ -23,6 +23,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+
 @functools.cache
 def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -61,6 +62,9 @@ def _rel_attention_kernel(
     NUM_SPLITS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # The DSpark draft block: no relative logits, every query sees the
+    # request's keys up to its last one (`WINDOW_LEFT` back from it).
+    DRAFT_BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     head = tl.program_id(1)
@@ -81,6 +85,9 @@ def _rel_attention_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     m_mask = offs_m < q_len
     pos = past + offs_m  # absolute position of each query
+    if DRAFT_BLOCK:
+        # The whole block sees the keys up to its last one.
+        pos = tl.zeros([BLOCK_M], tl.int32) + kv_len - 1
     tok = (q_start + offs_m).to(tl.int64)
 
     q = tl.load(
@@ -94,10 +101,15 @@ def _rel_attention_kernel(
     rel_row = REL + tok * stride_rt + head * stride_rh
 
     # Keys this query block can see, split into NUM_SPLITS contiguous chunks.
-    last_pos = past + tl.minimum((m_block + 1) * BLOCK_M, q_len) - 1
+    if DRAFT_BLOCK:
+        first_pos = kv_len - 1
+        last_pos = kv_len - 1
+    else:
+        first_pos = past + m_block * BLOCK_M
+        last_pos = past + tl.minimum((m_block + 1) * BLOCK_M, q_len) - 1
     lo = 0
     if WINDOW_LEFT > 0:
-        lo = tl.maximum(past + m_block * BLOCK_M - WINDOW_LEFT, 0)
+        lo = tl.maximum(first_pos - WINDOW_LEFT, 0)
     lo = lo // BLOCK_N * BLOCK_N
     num_n = tl.cdiv(last_pos + 1 - lo, BLOCK_N)
     per_split = tl.cdiv(num_n, NUM_SPLITS)
@@ -136,14 +148,16 @@ def _rel_attention_kernel(
         )
         s = tl.dot(q, tl.trans(k)) * qk_scale
 
-        col = k_pos[None, :] - col0[:, None]
-        in_cols = (col >= 0) & (col < E_PAD) & m_mask[:, None] & n_mask[None, :]
-        rel = tl.load(rel_row[:, None] + col, in_cols, other=0.0).to(tl.float32)
+        if not DRAFT_BLOCK:
+            col = k_pos[None, :] - col0[:, None]
+            in_cols = (col >= 0) & (col < E_PAD) & m_mask[:, None] & n_mask[None, :]
+            rel = tl.load(rel_row[:, None] + col, in_cols, other=0.0)
+            s += rel.to(tl.float32) * 1.4426950408889634
         dist = pos[:, None] - k_pos[None, :]
         visible = (dist >= 0) & n_mask[None, :] & m_mask[:, None]
         if WINDOW_LEFT > 0:
             visible = visible & (dist <= WINDOW_LEFT)
-        s = tl.where(visible, s + rel * 1.4426950408889634, float("-inf"))
+        s = tl.where(visible, s, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, 1))
         # Rows with no visible key yet keep m = -inf; shift them by 0.
@@ -243,6 +257,7 @@ def rel_attention(
         NUM_SPLITS=num_splits,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        DRAFT_BLOCK=False,
         num_warps=4,
         num_stages=2,
     )
@@ -258,3 +273,73 @@ def rel_attention(
     # gate_sink reads the LSE of every row: padding rows (and requests with
     # no keys) get 0, with a zero output.
     lse.masked_fill_(lse == float("-inf"), 0.0)
+
+
+def block_attention(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    block: int,
+    window: int,
+    num_splits: int,
+) -> None:
+    """`ops.attention.block_decode_attention` (the DSpark draft block) on the
+    Triton kernel: bf16 `(T, H * D)` `out`, where every query of a `block`
+    sees its request's keys up to the last one, or the last `window` of them
+    if `window`. Requests with no keys come out 0. `num_splits` depends only
+    on the batch, so the launch is the same on every CUDA-graph replay."""
+    num_tokens, num_heads, head_dim = q.shape
+    page, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
+    num_reqs = cache_seqlens.shape[0]
+    assert block <= 16 and num_tokens == num_reqs * block
+    assert q.stride(2) == 1 and key_cache.stride(3) == value_cache.stride(3) == 1
+    assert out.shape == (num_tokens, num_heads * head_dim) and out.is_contiguous()
+    num_splits = min(num_splits, 64)
+    o_part = q.new_zeros((num_splits, *q.shape), dtype=torch.float32)
+    lse_part = q.new_full(
+        (num_splits, num_tokens, num_heads), float("-inf"), dtype=torch.float32
+    )
+    _rel_attention_kernel[(num_reqs, num_heads, num_splits)](
+        q,
+        key_cache,
+        value_cache,
+        q,  # No relative logits.
+        block_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        o_part,
+        lse_part,
+        head_dim**-0.5,
+        q.stride(0),
+        q.stride(1),
+        *key_cache.stride()[:3],
+        *value_cache.stride()[:3],
+        0,
+        0,
+        block_table.stride(0),
+        num_tokens,
+        H=num_heads,
+        GROUP=num_heads // num_kv_heads,
+        D=head_dim,
+        E=0,
+        PAGE=page,
+        # The kernel's window counts keys before the query's own.
+        WINDOW_LEFT=max(window - 1, 0),
+        NUM_SPLITS=num_splits,
+        BLOCK_M=16,
+        BLOCK_N=64,
+        DRAFT_BLOCK=True,
+        num_warps=4,
+        num_stages=2,
+    )
+    if num_splits > 1:
+        weights = torch.exp(lse_part - torch.logsumexp(lse_part, 0)).nan_to_num_(0.0)
+        merged = (o_part * weights[..., None]).sum(0)
+    else:
+        merged = o_part[0]
+    out.copy_(merged.view(out.shape))

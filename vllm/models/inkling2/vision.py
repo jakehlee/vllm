@@ -23,7 +23,11 @@ from vllm.models.inkling2.ops.vision import (
     gather_patches,
     scaled_residual_norm_,
 )
+from vllm.platforms import current_platform
 from vllm.third_party.tml_fa4 import flash_attn_varlen_func
+
+# tml_fa4 is SM100-only: elsewhere (Ampere) the ViT runs on vLLM's FA2.
+_USE_FA2 = not current_platform.is_device_capability_family(100)
 
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -61,6 +65,8 @@ class Inkling2VisionAttention(nn.Module):
         qkv = self.qkv_proj(hidden)
         apply_rotary_qk_(qkv, metadata.meta, self.num_heads)
         q, k, v = qkv.view(-1, 3, self.num_heads, self.head_dim).unbind(1)
+        if _USE_FA2:
+            return self.out_proj(_fa2_attention(q, k, v, metadata).view(hidden.shape))
         out, _ = flash_attn_varlen_func(
             q,
             k,
@@ -73,6 +79,26 @@ class Inkling2VisionAttention(nn.Module):
             causal=False,
         )
         return self.out_proj(out.view(hidden.shape))
+
+
+def _fa2_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, metadata: VisionMetadata
+) -> torch.Tensor:
+    """Bidirectional varlen attention per image on FA2 (non-SM100)."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func as fa_varlen
+
+    return fa_varlen(
+        q,
+        k,
+        v,
+        max_seqlen_q=metadata.max_seqlen,
+        cu_seqlens_q=metadata.cu_seqlens,
+        max_seqlen_k=metadata.max_seqlen,
+        cu_seqlens_k=metadata.cu_seqlens,
+        softmax_scale=q.shape[-1] ** -0.5,
+        causal=False,
+        fa_version=2,
+    )
 
 
 class Inkling2VisionMLP(nn.Module):

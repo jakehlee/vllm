@@ -312,3 +312,43 @@ def dspark_argmax(
         out,
     )
     return out
+
+
+def shard_argmax_pairs(
+    base: torch.Tensor, bias: torch.Tensor, softcap: float, valid: int, offset: int
+) -> torch.Tensor:
+    """fp32 `(rows, 2)` (max, global index) of the first argmax (NaN as -inf)
+    of this rank's `add_softcap(base, bias, softcap)[:, :valid]`. Vocabulary
+    indices (< 2**24) are exact in fp32, so one all-gather carries both."""
+    from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+
+    assert base.dtype == bias.dtype == torch.bfloat16 and base.shape == bias.shape
+    logits = add_softcap(base, bias, softcap)[:, :valid]
+    index = greedy_argmax(logits)
+    value = logits.gather(1, index[:, None]).float()
+    value.masked_fill_(value.isnan(), float("-inf"))
+    return torch.cat([value, (index[:, None] + offset).float()], dim=1)
+
+
+def merge_argmax_pairs(pairs: torch.Tensor, num_rows: int) -> torch.Tensor:
+    """Rank-major gathered `shard_argmax_pairs` -> the gathered vocabulary's
+    first argmax: torch.argmax keeps the first (lowest) rank on ties."""
+    pairs = pairs.view(-1, num_rows, 2)
+    rank = pairs[..., 0].argmax(0)
+    return pairs[rank, torch.arange(num_rows, device=pairs.device), 1].long()
+
+
+def gather_argmax(
+    base: torch.Tensor,
+    bias: torch.Tensor,
+    softcap: float,
+    valid: int,
+    offset: int,
+) -> torch.Tensor:
+    """`dspark_argmax` without NVLink multicast (non-SM100): each rank's
+    shard argmax, all-gathered and merged."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    pairs = shard_argmax_pairs(base, bias, softcap, valid, offset)
+    pairs = tensor_model_parallel_all_gather(pairs, dim=0)
+    return merge_argmax_pairs(pairs, base.shape[0])

@@ -3,7 +3,12 @@
 """Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
 through a small dense transformer over DFlare-mixed target-feature K/V, then a
 recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
-implementation's draft (flashinfer RMSNorms, bf16 logits)."""
+implementation's draft (flashinfer RMSNorms, bf16 logits).
+
+Off SM100 (Ampere) the draft keeps its math but swaps the Blackwell-only
+pieces: vLLM's RMSNorm ops for FlashInfer's, an unfused all-reduce, the
+Triton block attention for the Gluon one, and an all-gather argmax for the
+NVLink-multicast one."""
 
 from collections.abc import Iterable
 from typing import cast
@@ -12,6 +17,7 @@ import torch
 from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 from torch import nn
 
+from vllm import _custom_ops as vllm_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -30,6 +36,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -39,10 +46,12 @@ from vllm.v1.attention.backends.flash_attn import (
 
 from .configs import Inkling2DSparkConfig
 from .ops.attention import block_decode_attention, plan_decode_attention
+from .ops.attention_triton import block_attention
 from .ops.dspark import (
     Inkling2DSparkArgmax,
     add_softcap,
     dspark_argmax,
+    gather_argmax,
     markov_gate,
     mix_rmsnorm,
     qk_norm_rope_,
@@ -50,7 +59,10 @@ from .ops.dspark import (
     silu_and_mul,
 )
 from .ops.linear import linear
+from .ops.norm import rms_norm
 from .speculator_config import Inkling2DSparkSpeculatorConfig
+
+_SM100 = current_platform.is_device_capability_family(100)
 
 
 class _RMSNorm(nn.Module):
@@ -62,6 +74,12 @@ class _RMSNorm(nn.Module):
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if not _SM100:
+            if residual is None:
+                return rms_norm(x, self.weight, self.eps)
+            # In place: residual += x; x = norm(residual).
+            vllm_ops.fused_add_rms_norm(x, residual, self.weight, self.eps)
+            return x
         if residual is None:
             return rmsnorm(x, self.weight, self.eps)
         # In place: residual += x; x = norm(residual), from the unrounded sum.
@@ -80,7 +98,7 @@ def all_reduce_add_rmsnorm(
     bf16 residual. Others all-reduce, then add and normalize.
     """
     fi_ar = getattr(get_tp_group().device_communicator, "fi_ar_comm", None)
-    if fi_ar is None or not fi_ar.should_use_fi_ar(x):
+    if not _SM100 or fi_ar is None or not fi_ar.should_use_fi_ar(x):
         return norm(tensor_model_parallel_all_reduce(x), residual)
     from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
         flashinfer_comm,
@@ -233,7 +251,8 @@ class Inkling2DraftSelfAttention(nn.Module):
                     self.window,
                 ),
             )
-            block_decode_attention(
+            attention = block_decode_attention if _SM100 else block_attention
+            attention(
                 q[:num_tokens].view(num_tokens, self.num_heads, self.head_dim),
                 canonicalize_singleton_dim_strides(key_cache),
                 canonicalize_singleton_dim_strides(value_cache),
@@ -496,8 +515,11 @@ class Inkling2DSparkModel(nn.Module):
         self.vocab_offset = get_tensor_model_parallel_rank() * num_cols
         self.valid_vocab = min(num_cols, self.config.vocab_size - self.vocab_offset)
         assert self.valid_vocab > 0
-        self.argmax_workspace = Inkling2DSparkArgmax(
-            get_tp_group().cpu_group, self.max_num_reqs, num_cols
+        # The SM100 argmax exchanges partials over NVLink multicast.
+        self.argmax_workspace = (
+            Inkling2DSparkArgmax(get_tp_group().cpu_group, self.max_num_reqs, num_cols)
+            if _SM100
+            else None
         )
         self.model.fuse_alpha.copy_(
             torch.softmax(self.model.fuse_weight.float(), dim=-1)
@@ -560,6 +582,14 @@ class Inkling2DSparkModel(nn.Module):
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         """`markov_logits(...).argmax(-1)`, NaN as -inf."""
+        if self.argmax_workspace is None:
+            return gather_argmax(
+                base_logits,
+                bias,
+                self.config.final_logit_softcapping,
+                self.valid_vocab,
+                self.vocab_offset,
+            )
         return dspark_argmax(
             self.argmax_workspace,
             base_logits,

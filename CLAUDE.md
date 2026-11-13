@@ -76,8 +76,8 @@ Note the gn13/gn14 IB measurement: NCCL ran NET/IB with GDR 0 across nodes (see 
 | `ops/linear.py` | FlashInfer CuTe DSL `mm_bf16` (<=32 rows) and a Triton TMA kernel (router, >=2048 rows) | cuBLAS for every batch; the plain Triton K-group kernel for the router | Written; first exercised by the truncated run |
 | `quant_config.py` | `Inkling2QuantConfig.get_min_capability()` returned 100, so `vllm/config/vllm.py:897` rejects the checkpoint on Ampere before loading | Returns 80 | **Done** (`3460a29`); the unit tests never reached this check |
 | `ops/allreduce.py`, `model.py` forward | NVLink multicast Lamport all-reduce; seq-parallel and fused conv-mix are gated on its workspace | `Inkling2AllReduceWorkspace.create` returns `None` off SM100, which also disables `seq_parallel` and `conv_mix` (`model.py:226-276`): unfused NCCL path, no `_C.inkling2_*` ops | Nothing to write; verify in the truncated-model run |
-| `vision.py` | `from vllm.third_party.tml_fa4 import flash_attn_varlen_func` for the ViT | SDPA / FA2 varlen fallback, or serve **text-only** first | **Not started**. Imports fine (checked), but would fail on the first image request |
-| `dspark.py`, `ops/dspark.py` | FlashInfer `rmsnorm` / `fused_add_rmsnorm`, TRT-LLM fused all-reduce + norm, `_C.inkling2_dspark_argmax` over NVLink multicast | Torch/`ops.norm` RMSNorms, unfused all-reduce, torch argmax over `all_gather` | **Not started**. Needed only for speculative decoding; serve without DSpark first |
+| `vision.py` | `tml_fa4.flash_attn_varlen_func` for the ViT attention (the other ViT kernels in `ops/vision.py` are plain Triton) | `_fa2_attention`: vLLM's FA2 varlen (`fa_version=2`, bidirectional, same `cu_seqlens`/`max_seqlen`), off SM100 | Written; `test_vision.py` (vs. a per-image SDPA reference + encoder CUDA-graph replay) now runs off SM100. **Not yet run on A100** |
+| `dspark.py`, `ops/dspark.py` | FlashInfer `rmsnorm` / `fused_add_rmsnorm`, TRT-LLM fused all-reduce + norm, Gluon `block_decode_attention`, `_C.inkling2_dspark_argmax` over NVLink multicast | Off SM100 (`_SM100` in `dspark.py`): `ops.norm.rms_norm` + `_custom_ops.fused_add_rms_norm`; unfused NCCL all-reduce; `attention_triton.block_attention` (the Triton kernel's `DRAFT_BLOCK` mode); `gather_argmax` (per-shard argmax, all-gather of fp32 `(max, index)` pairs, lowest rank wins ties) | Written; `test_dspark_ampere.py` (the SM100 tests' cases ported). **Not yet run on A100** |
 | `ops/{norm,attn_res,sconv,activation,vision}.py` | Plain Triton (`tldevice` intrinsics) | None expected beyond the PDL gate | `rms_norm` verified on A100; the rest gets covered by the truncated-model run |
 
 Numerics: the model was trained with NVFP4 *activations*. BF16 activations on Ampere are more precise but a
@@ -108,7 +108,7 @@ publishes an Ampere port.
 | `test-ampere.sh` | `VLLM_SRC=/scratch/chathpc-dev/vllm-inkling2-ampere sbatch inkling2/test-ampere.sh`: MoE + attention unit tests. Binds `VLLM_SRC/vllm/models/inkling2` over the image's copy, so it tests uncommitted edits without a rebuild |
 | `stage-checkpoint.sh` | Sourced helper: 16-way parallel copy of the checkpoint to `/tmp/$USER-models/Inkling-2-Small` (~3 min; checks free space: an old Inkling 1 copy may still sit in `/tmp/$USER-models`) |
 | `truncated-gn13.sh` | First 12 layers (global layers 5 and 11), TP2, eager, text only on gn13; then 5 request types against port 3011. `NUM_LAYERS=6` to shrink |
-| `tp8-node.sh` + `submit-tp8.sh` | TP8 over gn14 (head, rank 0, API on port 3012) + gn11/gn12/gn13 (headless), reservation `ChatHPC_pilot_warmup`. Node rank from the hostname. Toggles: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=4`. **gn11/gn12 IPs are guessed** (`192.168.12.41/.42`); the script fails loudly if wrong |
+| `tp8-node.sh` + `submit-tp8.sh` | TP8 over gn14 (head, rank 0, API on port 3012) + gn11/gn12/gn13 (headless), reservation `ChatHPC_pilot_warmup`. Node rank from the hostname. Toggles: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=4`. gn11-14 IPs `192.168.12.41`-`.44` (confirmed by the user) |
 
 Cluster paths: repo root `/scratch/chathpc-dev/vllm-inkling2-ampere` (`git pull` there), images in
 `/scratch/chathpc-dev/`, logs in `/home/jakelee/out/<jobid>.{out,err}`.
@@ -139,11 +139,12 @@ Next, in order:
    unit tests (`sconv`, `attn_res`, `norm` prologue paths, `vision` imports); the expert loader under vLLM's
    real loader (`process_weights_after_loading` is called via `weight_utils.py:1547`, which the unit tests
    call by hand); renderer/tokenizer files (`tiktoken/`)
-3. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`): verify gn11/gn12 IPs first; check worker logs first
+3. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`): check worker logs first
 4. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) through port 3012
 5. [ ] `ENFORCE_EAGER=0` (CUDA graphs). `attention.py` wraps `_attention` in `eager_break_during_capture`,
    so the Triton attention runs outside graphs; untested on Ampere
-6. [ ] DSpark fallbacks (`dspark.py`, `ops/dspark.py`), then `DSPARK=1`
-7. [ ] ViT fallback (`vision.py` imports `tml_fa4`), then `IMAGES=4`; or ship text-only
+6. [ ] DSpark fallbacks: written (see the table). Run `test-ampere.sh` (now includes `test_dspark_ampere.py`
+   and `test_vision.py`), then `DSPARK=1`. Check `SpecDecoding metrics` acceptance in the log
+7. [ ] ViT fallback: written. Same test run, then `IMAGES=4`
 8. [ ] Front end: fold the vLLM block of `tp8-node.sh` into a gn14 job with nginx/OWUI/LiteLLM (template:
    `../ChatHPC/llm-prod-inkling-dep-gn14.sh`), add a LiteLLM entry, benchmark
