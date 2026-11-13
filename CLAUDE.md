@@ -98,6 +98,16 @@ publishes an Ampere port.
 - [x] Branch from PR #67325, `avtc` remote added
 - [x] Blackwell dependency inventory (table above)
 - [ ] Checkpoint downloaded to `/scratch/chathpc-dev/vllm/huggingface/hub`
+- [x] Checkpoint downloaded (snapshot `e242a97e`)
+- [x] `check-ampere.sh` run on gn11 (A100 80GB PCIe), 2026-11-12:
+  - Image: vllm `0.1.dev25249+gb974b306f`, torch 2.14 / CUDA 13.0. `_C` has sm_80 cubins, `_moe_C` has sm_80;
+    Marlin ops are registered; every inkling2 module imports; plain inkling2 Triton (`rms_norm`) runs on sm80.
+  - **PDL fails on sm80**: ptxas rejects `griddepcontrol` (needs sm_90). Fixed in `ops/pdl.py`: `gdc_wait` /
+    `gdc_launch_dependents` / `launch_pdl` are gated on SM90+ across all inkling2 Triton kernels.
+  - **Marlin GEMM: `no kernel image is available`** on real layer 0 (NVFP4) and 40 (MXFP8) experts, surfacing
+    lazily at the next torch op. Which kernel is missing is open: `ChatHPC/inkling2/diag-marlin.sh` tests
+    GPTQ int4 / NVFP4 / MXFP4 / FP8 Marlin with `CUDA_LAUNCH_BLOCKING=1` and counts Marlin cubins per arch.
+    If the image built no sm80 Marlin kernels, the fallback is building `_C`/`_moe_C` for 8.0 (source build).
 - [ ] `vllm-openai_inkling-2-small.sif` pulled; `check-ampere.sh` results recorded here. Then `ChatHPC/inkling2/test-ampere.sh` runs the MoE and attention tests in the image
   - The image Dockerfile builds `TORCH_CUDA_ARCH_LIST='7.5 8.0 ... 12.0'` (CUDA 13.2), so sm80 kernels are
     expected; the check confirms it.

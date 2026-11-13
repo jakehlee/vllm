@@ -20,6 +20,8 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
+from .pdl import PDL, gdc_wait
+
 # Full-layer FA4 split estimate, fitted on GB200 over uniform and mixed
 # prefill batches (re-fit for other devices): one CTA per 256-row query tile
 # and head runs at ~10 TFLOPS per SM, and the split merge moves fp32 partials
@@ -282,7 +284,7 @@ def _gate_sink_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = col < H * D
@@ -330,7 +332,7 @@ def gate_sink(
         width // num_heads,
         512,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=PDL,
     )
 
 
@@ -463,7 +465,7 @@ def _rel_decode_combine_kernel(
         # gate and sink are ready.
         gate = tl.load(Gate + row * stride_gate + head * D + offs_d).to(tl.float32)
         sink = tl.load(Sink + row * stride_sink + head).to(tl.float32)
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     y_ptrs = Y + row * H * D + head * D + offs_d
     if row >= num_actual_tokens:
         tl.store(y_ptrs, tl.zeros([BLOCK_D], tl.float32))
@@ -1283,7 +1285,7 @@ def _decode_attention(
         DRAFT=draft,
         WINDOW=window,
         num_warps=4,
-        launch_pdl=True,
+        launch_pdl=PDL,
     )
     if fuse_gate:
         out[num_actual_tokens:].zero_()
@@ -1311,5 +1313,5 @@ def _decode_attention(
         BLOCK_D=block_d,
         GATED=not draft,
         num_warps=num_warps,
-        launch_pdl=True,
+        launch_pdl=PDL,
     )

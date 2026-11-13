@@ -14,6 +14,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .block_scales import _scale_offsets
+from .pdl import PDL, gdc_wait
 
 FP32_MAX = tl.constexpr(3.4028234663852886e38)
 
@@ -198,7 +199,7 @@ def _quantize_row(X, Values, Scales, Amax, row, K: tl.constexpr, BLOCK: tl.const
 def _nvfp4_quantize_kernel(
     X, Values, Scales, Amax, M, K: tl.constexpr, BLOCK: tl.constexpr
 ):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     for row in range(tl.program_id(0), M, tl.num_programs(0)):
         _quantize_row(X, Values, Scales, Amax, row, K, BLOCK)
 
@@ -229,6 +230,6 @@ def nvfp4_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
         BLOCK=block,
         num_warps=num_warps,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=PDL,
     )
     return values, scales, amax
