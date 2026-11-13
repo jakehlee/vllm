@@ -71,9 +71,10 @@ Note the gn13/gn14 IB measurement: NCCL ran NET/IB with GDR 0 across nodes (see 
 | Where | Blackwell dependency | Ampere replacement | State |
 |---|---|---|---|
 | `ops/attention.py`, `attention.py` | Prefill: vendored `tml_fa4` (`flash_fwd_sm100`). Decode/verify: Gluon kernels (TMEM, tcgen05, TMA) | `ops/attention_triton.py` (`rel_attention`): one Triton kernel for prefill, decode and verify, split-KV with a torch LSE merge. Reads the prologue's sheared rel logits directly, so `attention_prologue` and `gate_sink` stay shared. Picked off SM100 by `Inkling2Attention.use_triton`. Written fresh, not ported from avtc | **40/40 tests pass on A100**. Performance untuned |
-| `moe.py`, `ops/trtllm_bmm.py`, `ops/moe.py` | FlashInfer `trtllm_gen` SM100 BMMs, NVFP4/MXFP8 activation quantization fused into routing and SwiGLU, SM100 row shuffle / scale swizzle at load | `moe_marlin.py` (`Inkling2MarlinExperts`): raw load, Marlin repack in `process_weights_after_loading`, torch routing (stable sort for low-index ties), `fused_marlin_moe` with a custom softcapped-SwiGLU activation. NVFP4 global scale per expert = `amax / outer_scale_denominator` | Written. **Blocked on the image** (no bf16 sm_80 Marlin in `inkling-2-small`); rerun on the nightly-based image |
+| `moe.py`, `ops/trtllm_bmm.py`, `ops/moe.py` | FlashInfer `trtllm_gen` SM100 BMMs, NVFP4/MXFP8 activation quantization fused into routing and SwiGLU, SM100 row shuffle / scale swizzle at load | `moe_marlin.py` (`Inkling2MarlinExperts`): raw load, Marlin repack in `process_weights_after_loading`, torch routing (stable sort for low-index ties), `fused_marlin_moe` with a custom softcapped-SwiGLU activation. NVFP4 global scale per expert = `amax / outer_scale_denominator` | **13/13 tests pass on A100** (nightly-based image), incl. real full-size layers 0 (NVFP4) and 40 (MXFP8): the `amax / outer_scale_denominator` scale is confirmed |
 | `ops/*.py` Triton kernels (~25 sites in 8 files) | `gdc_wait` / `gdc_launch_dependents` / `launch_pdl=True` (programmatic dependent launch): ptxas rejects `griddepcontrol` below sm_90 | `ops/pdl.py`: constexpr-gated wrappers and a `PDL` flag, on for SM90+ only | **Done**, compiles on A100 (attention tests exercise `gate_sink` and the prologue's neighbors) |
-| `ops/linear.py` | FlashInfer CuTe DSL `mm_bf16` (<=32 rows) and a Triton TMA kernel (router, >=2048 rows) | cuBLAS for every batch; the plain Triton K-group kernel for the router | Written, untested |
+| `ops/linear.py` | FlashInfer CuTe DSL `mm_bf16` (<=32 rows) and a Triton TMA kernel (router, >=2048 rows) | cuBLAS for every batch; the plain Triton K-group kernel for the router | Written; first exercised by the truncated run |
+| `quant_config.py` | `Inkling2QuantConfig.get_min_capability()` returned 100, so `vllm/config/vllm.py:897` rejects the checkpoint on Ampere before loading | Returns 80 | **Done** (`3460a29`); the unit tests never reached this check |
 | `ops/allreduce.py`, `model.py` forward | NVLink multicast Lamport all-reduce; seq-parallel and fused conv-mix are gated on its workspace | `Inkling2AllReduceWorkspace.create` returns `None` off SM100, which also disables `seq_parallel` and `conv_mix` (`model.py:226-276`): unfused NCCL path, no `_C.inkling2_*` ops | Nothing to write; verify in the truncated-model run |
 | `vision.py` | `from vllm.third_party.tml_fa4 import flash_attn_varlen_func` for the ViT | SDPA / FA2 varlen fallback, or serve **text-only** first | **Not started**. Imports fine (checked), but would fail on the first image request |
 | `dspark.py`, `ops/dspark.py` | FlashInfer `rmsnorm` / `fused_add_rmsnorm`, TRT-LLM fused all-reduce + norm, `_C.inkling2_dspark_argmax` over NVLink multicast | Torch/`ops.norm` RMSNorms, unfused all-reduce, torch argmax over `all_gather` | **Not started**. Needed only for speculative decoding; serve without DSpark first |
@@ -87,50 +88,62 @@ different path, so quality needs a check (ChatHPC `bench/effort-sweep.py`, a few
 
 | Day | Work | Done when |
 |---|---|---|
-| **Thu 11-12** | Checkpoint + image, `check-ampere.sh`, MoE and attention fallbacks, PDL gate, A100 tests | **Done except the MoE tests**, which wait on the nightly-based image |
-| **Fri 11-13** | Build `vllm-inkling2-ampere.sif` (nightly `be47189f` + branch). `diag-marlin.sh` on the plain nightly (all 6 cases should pass), then `test-ampere.sh` (MoE incl. real layers 0 and 40). Truncated model (`--hf-overrides` ~6 layers incl. global layer 5) on 1-2 A100s, eager, text only, logits vs a dequantized torch reference | MoE tests pass; truncated-model logits match |
-| **Sat 11-14** | Full model **TP8** on the 4 nodes, eager, text only, no DSpark. Effort sweep for quality | **Go/no-go (Sat night)**: correct answers through the API |
-| **Sun 11-15** | CUDA graphs, then DSpark fallbacks + DSpark, then the ViT fallback (one change per restart) | Faster, still correct |
-| **Mon 11-16** | Scripts in `../ChatHPC` (`llm-prod-inkling2-*.sh`), LiteLLM entry, benchmark with `bench/bench-concurrency.py`, go live | Public endpoint serves it |
+| **Thu 11-12** | Checkpoint, images, MoE + attention fallbacks, PDL gate, A100 unit tests | **Done**: 53/53 tests pass |
+| **Fri 11-13** | Truncated run on gn13 (`truncated-gn13.sh`): mechanical end to end. Fix whatever it hits | Server answers all 5 request types |
+| **Sat-Sun** (when gn11-14 are free) | Full model TP8 (`submit-tp8.sh`), eager, text only -> effort sweep -> CUDA graphs -> DSpark -> vision, one change per restart | Correct answers through the API |
+| **Mon 11-16** | Front-end integration (gn14 job with nginx/OWUI/LiteLLM), LiteLLM entry, `bench/bench-concurrency.py`, go live | Public endpoint serves it |
 
 **Fallback (track A)**: if no-go, scale the existing Inkling-Small AWQ DEP setup to the 4 new nodes for
 Monday, and keep porting over the three weeks. Keep an eye on `avtc/vllm` and cyankiwi in case someone else
 publishes an Ampere port.
 
-## Status (2026-11-12, evening)
+## Cluster scripts (`../ChatHPC/inkling2/`, committed by the user; run from the ChatHPC repo root)
 
-Branch head: `69555f2` on `jakehlee/inkling2-ampere`. Cluster scripts: `../ChatHPC/inkling2/` (not yet
-committed to ChatHPC; copied to the cluster by hand).
+| Script | What it does |
+|---|---|
+| `download.sh` | Checkpoint into the GPFS HF cache (done) |
+| `vllm-inkling2-ampere.def` | **The image**: CI nightly `be47189f` + this branch's `.py`. Rebuild after every `git pull` of code: `apptainer build --fakeroot /scratch/chathpc-dev/vllm-inkling2-ampere.sif vllm-inkling2-ampere.def` |
+| `check-ampere.sh` + `check_ampere.py` | Image sanity: archs, ops, imports, PDL probe, real experts through Marlin |
+| `diag-marlin.sh` + `diag_marlin.py` | Marlin per (activation dtype, weight format), `CUDA_LAUNCH_BLOCKING=1` |
+| `test-ampere.sh` | `VLLM_SRC=/scratch/chathpc-dev/vllm-inkling2-ampere sbatch inkling2/test-ampere.sh`: MoE + attention unit tests. Binds `VLLM_SRC/vllm/models/inkling2` over the image's copy, so it tests uncommitted edits without a rebuild |
+| `stage-checkpoint.sh` | Sourced helper: 16-way parallel copy of the checkpoint to `/tmp/$USER-models/Inkling-2-Small` (~3 min; checks free space: an old Inkling 1 copy may still sit in `/tmp/$USER-models`) |
+| `truncated-gn13.sh` | First 12 layers (global layers 5 and 11), TP2, eager, text only on gn13; then 5 request types against port 3011. `NUM_LAYERS=6` to shrink |
+| `tp8-node.sh` + `submit-tp8.sh` | TP8 over gn14 (head, rank 0, API on port 3012) + gn11/gn12/gn13 (headless), reservation `ChatHPC_pilot_warmup`. Node rank from the hostname. Toggles: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=4`. **gn11/gn12 IPs are guessed** (`192.168.12.41/.42`); the script fails loudly if wrong |
+
+Cluster paths: repo root `/scratch/chathpc-dev/vllm-inkling2-ampere` (`git pull` there), images in
+`/scratch/chathpc-dev/`, logs in `/home/jakelee/out/<jobid>.{out,err}`.
+
+## Status (2026-11-12, night) — handoff
+
+Branch head: `3460a29` on `jakehlee/inkling2-ampere`. The cluster image was built from `69555f2`, so it lacks
+`3460a29` (the `get_min_capability` fix): **rebuild the image before the truncated run.**
 
 Done:
 - [x] Branch from PR #67325; Blackwell dependency inventory (table above)
-- [x] Checkpoint downloaded to `/scratch/chathpc-dev/vllm/huggingface/hub` (snapshot `e242a97e`, 393.5 GB, 36 files)
-- [x] `check-ampere.sh` on gn11 (A100 80GB PCIe) against `inkling-2-small`: vllm `0.1.dev25249+gb974b306f`,
-  torch 2.14 / CUDA 13.0; Marlin ops registered; every inkling2 module imports; Triton `rms_norm` correct on sm80.
-  Checkpoint layout confirmed: layer 0 NVFP4 (`uint8` [4608, 2304] w13, e4m3 scales, `amax` ~0.08-0.12,
-  denominator 2688), layer 40 MXFP8 (e4m3 [4608, 4608] w13, `uint8` scales)
+- [x] Checkpoint on GPFS (`/scratch/chathpc-dev/vllm/huggingface/hub`, snapshot `e242a97e`, 393.5 GB, 36 files)
+- [x] `check-ampere.sh` (gn11): checkpoint layout confirmed (layer 0 NVFP4 `uint8` [4608, 2304] w13 with e4m3
+  scales, `amax` ~0.08-0.12, denominator 2688; layer 40 MXFP8 e4m3 [4608, 4608] w13, `uint8` scales)
 - [x] PDL gate (`ops/pdl.py`): ptxas rejects `griddepcontrol` on sm_80
-- [x] Attention (`ops/attention_triton.py`): **40/40** `test_attention_triton.py` on gn13
-- [x] Root cause of `no kernel image is available` (`diag-marlin.sh`): fp16 Marlin works, bf16 Marlin missing.
-  `inkling-2-small` is a local build for `TORCH_CUDA_ARCH_LIST=10.0+PTX` (from its registry config). Use CI
-  nightly `nightly-be47189f37f6162991366ff6b91539f6e9d1f432` (`7.5 8.0 8.6 8.9 9.0 10.0 12.0`) as the base:
-  `ChatHPC/inkling2/vllm-inkling2-ampere.def`
-- [x] Routing tie-break (stable sort) and test-fixture teardown fixed
+- [x] Image: `inkling-2-small` is built for `TORCH_CUDA_ARCH_LIST=10.0+PTX` and lacks bf16 sm_80 Marlin. CI
+  nightly `nightly-be47189f37f6162991366ff6b91539f6e9d1f432` has all 6 Marlin cases passing (`diag-marlin.sh`).
+  `/scratch/chathpc-dev/vllm-inkling2-ampere.sif` = nightly + branch, built
+- [x] **53/53 unit tests on gn13 with the new image** (`test-ampere.sh`): Marlin MoE 13/13 incl. real layers 0
+  and 40, Triton attention 40/40
+- [x] `get_min_capability` 100 -> 80 (`3460a29`)
+- [x] Truncated-run and TP8 job scripts written (not yet run)
 
-In progress:
-- [x] Nightly `be47189f` pulled as `/scratch/chathpc-dev/vllm-openai_nightly-be47189f.sif`;
-  `/scratch/chathpc-dev/vllm-inkling2-ampere.sif` built from the `.def`
-- [x] `diag-marlin.sh` on the plain nightly: **all 6 Marlin cases pass**, bf16 included (rel. error ~2e-3);
-  481 sm_80 Marlin kernels in each of `_C` and `_moe_C` (vs 226 and 481 fp16-only in `inkling-2-small`)
-- [ ] `test-ampere.sh` on the new image: MoE tests (random weights, EP=4 emulation, real layers 0 and 40),
-  attention still 40/40
-
-Next:
-- [ ] Truncated-model run (~6 layers incl. global layer 5) on 1-2 A100s: verifies `linear`, the unfused
-  all-reduce path, `sconv`/`attn_res`/`norm`, and weight loading end to end
-- [ ] Serving scripts for TP8 over 4 x 2 A100 (node-local checkpoint staging, `/tmp` compile caches, IB
-  NCCL settings from the Inkling 1 scripts)
-- [ ] Full model, eager, text only, no DSpark -> effort sweep -> CUDA graphs
-- [ ] DSpark fallbacks (`dspark.py`, `ops/dspark.py`)
-- [ ] ViT attention fallback (`vision.py`), or ship text-only
-- [ ] Quality check vs the Blackwell numbers (NVFP4 activations there, BF16 here)
+Next, in order:
+1. [ ] `git pull` in `/scratch/chathpc-dev/vllm-inkling2-ampere`, rebuild the image (see the table)
+2. [ ] `sbatch inkling2/truncated-gn13.sh`. Pass = all 5 requests return. Expect gibberish text (36 of 48
+   layers missing). Likely first failures, cheapest first: an Ampere-incompatible kernel not covered by the
+   unit tests (`sconv`, `attn_res`, `norm` prologue paths, `vision` imports); the expert loader under vLLM's
+   real loader (`process_weights_after_loading` is called via `weight_utils.py:1547`, which the unit tests
+   call by hand); renderer/tokenizer files (`tiktoken/`)
+3. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`): verify gn11/gn12 IPs first; check worker logs first
+4. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) through port 3012
+5. [ ] `ENFORCE_EAGER=0` (CUDA graphs). `attention.py` wraps `_attention` in `eager_break_during_capture`,
+   so the Triton attention runs outside graphs; untested on Ampere
+6. [ ] DSpark fallbacks (`dspark.py`, `ops/dspark.py`), then `DSPARK=1`
+7. [ ] ViT fallback (`vision.py` imports `tml_fa4`), then `IMAGES=4`; or ship text-only
+8. [ ] Front end: fold the vLLM block of `tp8-node.sh` into a gn14 job with nginx/OWUI/LiteLLM (template:
+   `../ChatHPC/llm-prod-inkling-dep-gn14.sh`), add a LiteLLM entry, benchmark
