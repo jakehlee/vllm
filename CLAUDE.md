@@ -89,7 +89,7 @@ different path, so quality needs a check (ChatHPC `bench/effort-sweep.py`, a few
 | Day | Work | Done when |
 |---|---|---|
 | **Thu 11-12** | Checkpoint, images, MoE + attention fallbacks, PDL gate, A100 unit tests; DSpark + ViT fallbacks; truncated run | **Done**: 73/73 tests, truncated run answers all 5 request types |
-| **Fri 11-13** (gn13 only) | Truncated runs of each later toggle: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=1` | Each one serves without errors |
+| **Fri 11-13** (one node) | Truncated runs of each later toggle: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=1`; production job scripts | CUDA graphs and DSpark (both samplers) **pass**; images pending |
 | **Sat-Sun** (when gn11-14 are free) | Full model TP8 (`submit-tp8.sh`), eager, text only -> effort sweep -> CUDA graphs -> DSpark -> vision, one change per restart | Correct answers through the API |
 | **Mon 11-16** | Front-end integration (gn14 job with nginx/OWUI/LiteLLM), LiteLLM entry, `bench/bench-concurrency.py`, go live | Public endpoint serves it |
 
@@ -108,7 +108,10 @@ publishes an Ampere port.
 | `test-ampere.sh` | `VLLM_SRC=/scratch/chathpc-dev/vllm-inkling2-ampere sbatch inkling2/test-ampere.sh`: MoE + attention unit tests. Binds `VLLM_SRC/vllm/models/inkling2` over the image's copy, so it tests uncommitted edits without a rebuild |
 | `stage-checkpoint.sh` | Sourced helper: 16-way parallel copy of the checkpoint to `/tmp/$USER-models/Inkling-2-Small` (~3 min; checks free space: an old Inkling 1 copy may still sit in `/tmp/$USER-models`) |
 | `truncated-gn13.sh` | First 12 layers (global layers 5 and 11), TP2 on gn13; then 5 request types (+ an image request with `IMAGES>0`) against port 3011. Same toggles as `tp8-node.sh`: `ENFORCE_EAGER=0`, `DSPARK=1` (`DSPARK_SAMPLE=greedy` for the argmax path), `IMAGES=1`. Serves a symlink view of the staged checkpoint with a rewritten `config.json` (`num_hidden_layers`, and DSpark `target_layer_ids` remapped to the last 7 truncated layers + 12): `--hf-overrides` doesn't reach the draft config. `NUM_LAYERS` >= 7 |
-| `tp8-node.sh` + `submit-tp8.sh` | TP8 over gn14 (head, rank 0, API on port 3012) + gn11/gn12/gn13 (headless), reservation `ChatHPC_pilot_warmup`. Node rank from the hostname. Toggles: `ENFORCE_EAGER=0`, `DSPARK=1`, `IMAGES=4`. gn11-14 IPs `192.168.12.41`-`.44` (confirmed by the user) |
+| `engine.sh` | Sourced by both TP8 jobs: the one vLLM engine definition (TP8 args, toggles `ENFORCE_EAGER` / `DSPARK` / `IMAGES` / `IMAGE`, default image `vllm-inkling2-ampere-dspark.sif`), node IPs `192.168.12.41`-`.44` and ranks (gn14 0, gn11 1, gn12 2, gn13 3), checkpoint staging, workers waiting on gn14:29560. Flip a default here once TP8 confirms it |
+| `tp8-node.sh` + `submit-tp8.sh` | Bring-up: TP8 head on gn14 (API on port 3012, no front end) + headless gn11-13, reservation `ChatHPC_pilot_warmup`. `tp8-node.sh` is also the headless worker for production |
+| `prod-gn14.sh` + `submit-prod.sh` | Production: TP8 head on gn14 (API on 3010, `inkling2-small:128k`, API key and OTLP as before) + the whole front end (nginx, OWUI, LiteLLM, Grafana, TEI, Docling, Kokoro, PR-Agent, from the Inkling 1 DEP job), workers via `tp8-node.sh`. **Not yet run.** Stop the current gn14 job first |
+| `litellm.yml` | Bound into the production LiteLLM as `config_inkling2.yml`: `inkling2-small:128k`, with `inkling-small:128k`, `gemma4:31b-128k`, `laguna-s:118b-128k` as aliases |
 
 Cluster paths: repo root `/scratch/chathpc-dev/vllm-inkling2-ampere` (`git pull` there), images in
 `/scratch/chathpc-dev/`, logs in `/home/jakelee/out/<jobid>.{out,err}`.
@@ -138,24 +141,27 @@ Done:
   (120k tokens); ~25 tok/s single-stream eager. Output is gibberish, as expected with 36 layers missing
 - [x] gn11-14 IPs confirmed: `192.168.12.41`-`.44` (as in `tp8-node.sh`)
 
-Next. Steps 1-4 need only gn13 (one node); the TP8 steps need all four.
-1. [ ] Rebuild the image from the current head (`-dspark.sif`, see above)
-2. [ ] `IMAGE=...-dspark.sif ENFORCE_EAGER=0 sbatch inkling2/truncated-gn13.sh`: CUDA graphs on Ampere.
-   `attention.py` wraps `_attention` in `eager_break_during_capture` (breakable graphs auto-enabled), so the
-   Triton attention runs outside graphs; Inkling 1 lost a worker during capture (see ChatHPC `AGENTS.md`)
-3. [ ] `DSPARK=1` (eager): DSpark loads `mtp.safetensors`, captures 7 target features, drafts 7 tokens. Pass =
-   serves without errors and the log shows `SpecDecoding metrics`; acceptance is meaningless with a truncated
-   target. Then `DSPARK=1 DSPARK_SAMPLE=greedy` once for the `gather_argmax` path (`probabilistic`, the
-   production setting, all-gathers logits instead). The draft's TP2 all-reduce/all-gather paths run here
-   for the first time
-4. [ ] `IMAGES=1` (eager): processor, ViT on FA2, embedding merge, one image request
+Next. Steps 1-4 need one node; the TP8 steps need all four.
+1. [x] Image rebuilt from the DSpark/ViT head: `/scratch/chathpc-dev/vllm-inkling2-ampere-dspark.sif` (now the
+   default in every script). The truncated runs below ran on gn12, so gn12 (like gn13) already has the
+   checkpoint staged in `/tmp/jakelee-models`
+2. [x] `ENFORCE_EAGER=0` truncated (651038): **breakable CUDA graphs captured** (5 PIECEWISE + 4 FULL sizes,
+   4 s, 0.09 GiB), all 5 request types pass, no errors. No speed gain at TP2 x 12 layers (25.3 tok/s vs 25 eager:
+   one request, and the Triton attention runs outside graphs); the real comparison is at TP8
+3. [x] `DSPARK=1` truncated, probabilistic (651043) and greedy / `gather_argmax` (651044): draft loads
+   (`Inkling2DSparkModel`, +1.7 GiB per GPU at TP2), all 5 request types pass, `SpecDecoding metrics` logged.
+   Acceptance 0.1% (1 of ~1500 drafted), **expected**: the draft reads features of a 12-layer target it was
+   never trained on. With nothing accepted, decode was 18-20 tok/s vs 25 without DSpark (7 drafted tokens
+   per step cost ~25% here). Real acceptance needs the full model
+4. [ ] `IMAGES=1` truncated (651045): processor, ViT on FA2, embedding merge, one image request. Ran; log not
+   yet reviewed
 5. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only: check worker logs first
 6. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) through port 3012
 7. [ ] TP8 `ENFORCE_EAGER=0`, then `DSPARK=1` (check acceptance in `SpecDecoding metrics`), then `IMAGES=4`,
    one change per restart
-8. [ ] Front end: fold the vLLM block of `tp8-node.sh` into a gn14 job with nginx/OWUI/LiteLLM (template:
-   `../ChatHPC/llm-prod-inkling-dep-gn14.sh`), add a LiteLLM entry, benchmark. This can be written now;
-   it only needs the four nodes to run
+8. [ ] Front end: **written** (`prod-gn14.sh`, `submit-prod.sh`, `litellm.yml`; see the scripts table), not yet
+   run. Once TP8 bring-up passes: stop the current gn14 job, `inkling2/submit-prod.sh`, check OWUI, then
+   `bench/bench-concurrency.py --model inkling2-small:128k` against the Inkling 1 table in ChatHPC `AGENTS.md`
 
 Known risks:
 - DSpark at TP8: each greedy draft step all-gathers across nodes (7 per draft); probabilistic sampling
