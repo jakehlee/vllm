@@ -11,7 +11,8 @@ Small", WoosukKwon), which states **"Blackwell (SM100) only"**. Remote `avtc` ha
 (`feature/inkling-w4a16-mixed-precision-ampere`), kept for reference (the Inkling 2 attention kernel was written
 fresh). Push to remote `jakehlee` (`jakehlee/vllm`). GitHub's "N commits ahead of avtc/vllm:main" banner is
 expected: the fork's parent is avtc, whose `main` is stale. The branch is upstream main `efe12305f0` + the PR +
-our commits. On the cluster the checkout is `/scratch/chathpc-dev/vllm-inkling2-ampere/vllm`.
+our commits. On the cluster the repo root is `/scratch/chathpc-dev/vllm-inkling2-ampere` (so `VLLM_SRC` points there, and the
+`vllm/` package is `/scratch/chathpc-dev/vllm-inkling2-ampere/vllm/`).
 
 ## Ground rules
 
@@ -117,9 +118,10 @@ Done:
 - [x] Routing tie-break (stable sort) and test-fixture teardown fixed
 
 In progress:
-- [ ] Pull nightly `be47189f` as `/scratch/chathpc-dev/vllm-openai_nightly-be47189f.sif`; build
-  `/scratch/chathpc-dev/vllm-inkling2-ampere.sif` from the `.def`
-- [ ] `diag-marlin.sh` on the plain nightly: all 6 Marlin cases pass (confirms the diagnosis)
+- [x] Nightly `be47189f` pulled as `/scratch/chathpc-dev/vllm-openai_nightly-be47189f.sif`;
+  `/scratch/chathpc-dev/vllm-inkling2-ampere.sif` built from the `.def`
+- [x] `diag-marlin.sh` on the plain nightly: **all 6 Marlin cases pass**, bf16 included (rel. error ~2e-3);
+  481 sm_80 Marlin kernels in each of `_C` and `_moe_C` (vs 226 and 481 fp16-only in `inkling-2-small`)
 - [ ] `test-ampere.sh` on the new image: MoE tests (random weights, EP=4 emulation, real layers 0 and 40),
   attention still 40/40
 
