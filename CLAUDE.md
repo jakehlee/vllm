@@ -154,8 +154,12 @@ Next. Steps 1-4 need one node; the TP8 steps need all four.
    now fixed with `-d @file`): the ViT loads (encoder cache profiled with one image) and **the image request
    returns 200** with 119 prompt tokens = 96 image tokens (480x320 at 40 px per merged patch: 12 x 8) + 23
    text, so the processor, the ViT on FA2 and the embedding merge all run. No errors. The text requests pass too
-   5. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only: check worker logs first
-6. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) through port 3012
+   5. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only: check worker logs first. With only two
+   nodes free, `NODES="gn14 gn12" NUM_LAYERS=30 inkling2/submit-tp8.sh` (TP4, 30 layers ~52 GiB per GPU)
+   tests the cross-node path; three nodes can't run (TP6 doesn't divide 8 KV heads, PP must be 1)
+6. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) against port 3012, run on gn14
+   inside the image: `CHATHPC_API_KEY=none apptainer exec <image> python3 bench/effort-sweep.py --url
+   http://localhost:3012/v1/chat/completions --model inkling2-small`
 7. [ ] TP8 `ENFORCE_EAGER=0`, then `DSPARK=1` (check acceptance in `SpecDecoding metrics`), then `IMAGES=4`,
    one change per restart
 8. [ ] Front end: **written** (`prod-gn14.sh`, `submit-prod.sh`, `litellm.yml`; see the scripts table), not yet
