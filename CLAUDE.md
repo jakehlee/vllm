@@ -154,14 +154,20 @@ Next. Steps 1-4 need one node; the TP8 steps need all four.
    now fixed with `-d @file`): the ViT loads (encoder cache profiled with one image) and **the image request
    returns 200** with 119 prompt tokens = 96 image tokens (480x320 at 40 px per merged patch: 12 x 8) + 23
    text, so the processor, the ViT on FA2 and the embedding merge all run. No errors. The text requests pass too
-   5. [ ] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only: check worker logs first. With only two
+5. [x] TP8 on gn11-14 (`inkling2/submit-tp8.sh`), eager, text only (2026-11-15): starts and serves; quick
+   sanity at `reasoning_effort` 0 is correct (17 x 23 = 391, Canberra, a coherent haiku), so the full-model
+   numerics on Marlin + Triton attention look right. ~12 tok/s single-stream eager. Check worker logs first. With only two
    nodes free, `NODES="gn14 gn12" NUM_LAYERS=30 inkling2/submit-tp8.sh` (TP4, 30 layers ~52 GiB per GPU)
    tests the cross-node path; three nodes can't run (TP6 doesn't divide 8 KV heads, PP must be 1)
 6. [ ] Full model quality: effort sweep (`bench/effort-sweep.py`, answer 4.22 km/s) against port 3012, run on gn14
    inside the image: `CHATHPC_API_KEY=none apptainer exec <image> python3 bench/effort-sweep.py --url
    http://localhost:3012/v1/chat/completions --model inkling2-small`
-7. [ ] TP8 `ENFORCE_EAGER=0`, then `DSPARK=1` (check acceptance in `SpecDecoding metrics`), then `IMAGES=4`,
-   one change per restart
+7. [x] TP8 `ENFORCE_EAGER=0` (2026-11-15): breakable graphs captured (7 PIECEWISE + 5 FULL sizes), **43.9 tok/s single-stream vs ~12 eager (3.7x)**, now the default in `engine.sh`.
+   [x] `DSPARK=1` + graphs (2026-11-15, probabilistic): **118-180 tok/s single-stream (~3.5x over graphs alone)**, draft acceptance 34-60% (mean acceptance length 3.4-5.2, position 1 at 0.71-0.90), now the default in `engine.sh`. Drafted throughput is flat at ~241 tok/s = ~34.5 steps/s vs ~44 without DSpark: the draft and verify cost ~20% per step, far less than it gains. `DSPARK_SAMPLE=greedy` is untried at TP8.
+   [x] `IMAGES=4` + graphs + DSpark (2026-11-15): a 1161x1600 photo (~1200 image tokens) is described
+   correctly (a Mars rover on rocky terrain). A full-size photo (17,515 tokens) got a 400: the processor
+   doesn't resize (one token per 40x40 px tile), and the encoder cache is `--max-num-batched-tokens` (4096),
+   so production raises it to 8192 (~13 MP). All three toggles are now the `engine.sh` defaults
 8. [ ] Front end: **written** (`prod-gn14.sh`, `submit-prod.sh`, `litellm.yml`; see the scripts table), not yet
    run. Once TP8 bring-up passes: stop the current gn14 job, `inkling2/submit-prod.sh`, check OWUI, then
    `bench/bench-concurrency.py` (defaults to `inkling2-small:128k`) to find the concurrency it sustains
