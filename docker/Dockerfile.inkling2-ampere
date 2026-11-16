@@ -1,0 +1,32 @@
+# Inkling 2 Small on Ampere: vLLM's CI nightly at be47189f plus this branch's Python files.
+#
+# be47189f is 4 Python-only commits before the base of PR #67325 and is built for
+# TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 8.9 9.0 10.0 12.0", so it has the bf16 sm_80 Marlin kernels the experts
+# need. The PR's C++ additions (csrc/inkling2, trtllm_bmm) are SM100-only and unreachable on Ampere, so the
+# nightly's compiled extensions match and nothing here is compiled. Don't base this on
+# vllm/vllm-openai:inkling-2-small: it is built for 10.0+PTX only (no bf16 sm_80 Marlin).
+#
+# From the repo root:
+#   docker build -f docker/Dockerfile.inkling2-ampere -t vllm-inkling2-ampere .
+# Apptainer:
+#   apptainer build vllm-inkling2-ampere.sif docker-daemon://vllm-inkling2-ampere:latest
+
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-be47189f37f6162991366ff6b91539f6e9d1f432
+FROM ${BASE_IMAGE}
+
+COPY vllm /tmp/vllm-inkling2-pkg
+
+# .py files, plus the trtllm_bmm .cu source the SM100 path JIT-compiles at runtime
+RUN set -e; \
+    VLLM_DIR=$(python3 -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec('vllm').origin))"); \
+    echo "Overlaying the inkling2-ampere branch onto ${VLLM_DIR}"; \
+    cd /tmp/vllm-inkling2-pkg; \
+    find . \( -name "*.py" -o -path "./models/inkling2/ops/*.cu" \) -exec cp --parents -f {} "${VLLM_DIR}/" \; ; \
+    cd /; rm -rf /tmp/vllm-inkling2-pkg; \
+    test -f "${VLLM_DIR}/_C_stable_libtorch.abi3.so"; \
+    test -f "${VLLM_DIR}/_moe_C_stable_libtorch.abi3.so"; \
+    test -f "${VLLM_DIR}/models/inkling2/moe_marlin.py"; \
+    test -f "${VLLM_DIR}/models/inkling2/ops/pdl.py"; \
+    python3 -m compileall -q "${VLLM_DIR}/models/inkling2"
+
+ENTRYPOINT ["vllm", "serve"]

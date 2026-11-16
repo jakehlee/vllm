@@ -82,6 +82,8 @@ and copy this branch's `vllm/**/*.py` (plus `vllm/models/inkling2/ops/*.cu`, whi
 over the installed package. The PR's C++ additions are SM100-only kernels, unreachable on Ampere, so the
 nightly's compiled extensions match. **Not** `vllm/vllm-openai:inkling-2-small`: it is built for `10.0+PTX`
 only, and its sm_80 Marlin coverage is partial (fp16 kernels run, bf16 ones don't).
+`docker/Dockerfile.inkling2-ampere` does exactly this (`docker build -f docker/Dockerfile.inkling2-ampere
+-t vllm-inkling2-ampere .` from the repo root; `apptainer build ... docker-daemon://...` for Apptainer).
 
 ## Tests (one A100)
 

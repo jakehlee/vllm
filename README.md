@@ -1,11 +1,50 @@
 <!-- markdownlint-disable MD001 MD041 -->
 > [!IMPORTANT]
-> **This is the `inkling2-ampere` branch of a personal fork, not upstream vLLM.** It is a work-in-progress port of
-> [Inkling 2 Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) to Ampere (A100) GPUs, built on
+> **This is the `inkling2-ampere` branch of a personal fork, not upstream vLLM.** It runs
+> [Inkling 2 Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) on **Ampere (A100) GPUs**, built on
 > [vllm-project/vllm#67325](https://github.com/vllm-project/vllm/pull/67325), whose kernels are Blackwell (SM100)
-> only. The released NVFP4/MXFP8 checkpoint is served unmodified, with weight-only Marlin GEMMs for the experts.
-> Blackwell code paths are left untouched; Ampere fallbacks are selected by GPU capability.
-> Status, plan, and design notes: [`CLAUDE.md`](CLAUDE.md). Not intended for upstream merge as-is.
+> only. Not intended for upstream merge as-is. The upstream vLLM README follows the section below.
+
+## Inkling 2 Small on 8x A100-80GB
+
+The released NVFP4/MXFP8 checkpoint is served **unmodified**: the routed experts run as weight-only Marlin GEMMs
+with BF16 activations, and every other Blackwell-only kernel (attention, DSpark drafting, the ViT, fused
+all-reduces, PDL) has an SM80 fallback selected by GPU capability. The Blackwell code paths are untouched.
+
+- **Hardware:** 8 A100-80GB GPUs (tested as 4 nodes x 2 GPUs over InfiniBand), **TP8**. The model's experts are
+  sharded over the TP group and it asserts PP = 1, so it needs exactly 8 GPUs: TP must divide the 8 KV heads, and
+  4 GPUs (TP4) can't hold the full model. A single 8-GPU node or 2 x 4 should work the same way but is untested.
+- **Speed (4 x 2 A100, InfiniBand):** ~12 tok/s eager, 44 tok/s with CUDA graphs, **90-180 tok/s with DSpark**
+  speculative decoding, single stream; 353 tok/s aggregate at 16 concurrent requests (23 tok/s each).
+- **Context:** 128k, text + images (images aren't resized: about 6.5 MP max at the settings below).
+- **Numerics:** the model was trained with NVFP4 activations; this path runs BF16 activations. Answers, image
+  descriptions and DSpark acceptance (34-60%) look right, but no formal eval has been run yet.
+
+**Image:** a vLLM CI nightly plus this branch's Python files; nothing is compiled
+([`docker/Dockerfile.inkling2-ampere`](docker/Dockerfile.inkling2-ampere)):
+
+```bash
+docker build -f docker/Dockerfile.inkling2-ampere -t vllm-inkling2-ampere .
+```
+
+**Serve:** the same command on every node, rank 0 first; ranks 1-3 replace the last line with `--headless`.
+
+```bash
+vllm serve thinkingmachines/Inkling-2-Small --tensor-parallel-size 8 --nnodes 4 --node-rank <0-3> \
+    --master-addr <rank-0 IP> --master-port 29560 --no-numa-bind \
+    --max-model-len 131072 --max-num-batched-tokens 4096 --max-num-seqs 16 --gpu-memory-utilization 0.95 \
+    --limit-mm-per-prompt.image 4 --limit-mm-per-prompt.audio 0 \
+    --enable-chunked-prefill --enable-prefix-caching --async-scheduling \
+    --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, "draft_sample_method": "probabilistic"}' \
+    --reasoning-parser inkling --tool-call-parser inkling --enable-auto-tool-choice
+```
+
+Put the 393.5 GB checkpoint on node-local SSD, set `VLLM_ENGINE_READY_TIMEOUT_S=3600`, and point
+`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` / `VLLM_HOST_IP` at the InfiniBand interface.
+**[`CLAUDE.md`](CLAUDE.md)** has the details: each kernel replacement and its tests (73 pass on one A100), the
+memory budget, deployment notes, and the full results.
+
+---
 
 <p align="center">
   <picture>
