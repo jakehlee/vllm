@@ -168,9 +168,11 @@ Next. Steps 1-4 need one node; the TP8 steps need all four.
    correctly (a Mars rover on rocky terrain). A full-size photo (17,515 tokens) got a 400: the processor
    doesn't resize (one token per 40x40 px tile), and the encoder cache is `--max-num-batched-tokens` (4096),
    so production raises it to 8192 (~13 MP). All three toggles are now the `engine.sh` defaults
-8. [ ] Front end: **written** (`prod-gn14.sh`, `submit-prod.sh`, `litellm.yml`; see the scripts table), not yet
-   run. Once TP8 bring-up passes: stop the current gn14 job, `inkling2/submit-prod.sh`, check OWUI, then
-   `bench/bench-concurrency.py` (defaults to `inkling2-small:128k`) to find the concurrency it sustains
+8. [x] Front end live (2026-11-15): `inkling2/submit-prod.sh`, model `inkling2-small:128k`. TEI on CPU,
+   `--gpu-memory-utilization 0.95`, `--max-num-batched-tokens 4096` (8192 can't hold one 128k request: 27.95 GiB
+   of KV needed vs 22.5 available). `bench-concurrency.py` straight at gn14:3010 (graphs + DSpark, effort 0.7,
+   1024 max tokens), aggregate / per-request tok/s: c1 90 / 91, c2 143 / 76, c4 212 / 56, c8 277 / 37,
+   c16 353 / 23; TTFT p50 <= 1.5 s throughout
 
 Known risks:
 - DSpark at TP8: each greedy draft step all-gathers across nodes (7 per draft); probabilistic sampling
