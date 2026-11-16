@@ -108,7 +108,7 @@ different path, so quality needs a check (ChatHPC `bench/effort-sweep.py`, a few
 | `engine.sh` | Sourced by both TP8 jobs: the one vLLM engine definition (TP8 args, toggles `ENFORCE_EAGER` / `DSPARK` / `IMAGES` / `IMAGE`, default image `vllm-inkling2-ampere-dspark.sif`), node IPs `192.168.12.41`-`.44` and ranks (gn14 0, gn11 1, gn12 2, gn13 3), checkpoint staging, workers waiting on gn14:29560. Flip a default here once TP8 confirms it |
 | `tp8-node.sh` + `submit-tp8.sh` | Bring-up: TP8 head on gn14 (API on port 3012, no front end) + headless gn11-13, reservation `ChatHPC_pilot_warmup`. `tp8-node.sh` is also the headless worker for production |
 | `prod-gn14.sh` + `submit-prod.sh` | Production: TP8 head on gn14 (API on 3010, `inkling2-small:128k`, API key and OTLP as before) + the whole front end (nginx, OWUI, LiteLLM, Grafana, TEI, Docling, Kokoro, PR-Agent, as in the previous gn14 jobs), workers via `tp8-node.sh`. **Not yet run.** Stop the current gn14 job first |
-| `litellm.yml` | Bound into the production LiteLLM as `config_inkling2.yml`: the one model, `inkling2-small:128k` (no aliases for earlier models: a 3-week campaign) |
+| `litellm.yml` | Copied by hand to `/scratch/chathpc-dev/litellm/config-inkling2.yml`, which the production LiteLLM reads: the one model, `inkling2-small:128k` (no aliases for earlier models: a 3-week campaign) |
 
 Cluster paths: repo root `/scratch/chathpc-dev/vllm-inkling2-ampere` (`git pull` there), images in
 `/scratch/chathpc-dev/`, logs in `/home/jakelee/out/<jobid>.{out,err}`.
